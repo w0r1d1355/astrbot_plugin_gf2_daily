@@ -43,5 +43,17 @@
     "description": "输出已兑换商品的兑换日志",
     "type": "bool",
     "default": false
+  },
+  "enable_schedule": {
+    "description": "启用每日定时任务",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后将在指定时间自动执行完整每日任务，需先使用 /gf2 订阅 命令注册通知会话"
+  },
+  "schedule_time": {
+    "description": "每日定时执行时间",
+    "type": "string",
+    "default": "09:00",
+    "hint": "格式为 HH:MM（24小时制），例如 09:00 表示早上9点"
   }
 }
