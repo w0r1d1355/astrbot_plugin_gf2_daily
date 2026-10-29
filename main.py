@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
 """少前2社区每日任务插件"""
 
-import hashlib
 import asyncio
 import base64
-import aiohttp
-from typing import Optional, List, Dict, Any, Tuple
+import hashlib
+import json
+import os
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
+import aiohttp
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.star import Context, Star, register
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger, AstrBotConfig
 
 BASE_API = "https://gf2-bbs-api.exiliumgf.com"
 ENCRYPTION_KEY = "a86a86^oH$04r6A1"
@@ -32,11 +34,16 @@ def _encrypt_data(text: str, key: str) -> str:
     return b64.replace("+", "-").replace("/", "_").rstrip("=")
 
 
-@register("astrbot_plugin_gf2_daily", "Blueteemo", "少前2社区每日任务", "1.0.1")
+@register("astrbot_plugin_gf2_daily", "Blueteemo", "少前2社区每日任务", "1.1.0")
 class GF2DailyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self._scheduler_task_obj = None
+        self._subscriptions = set()
+        self._load_subscriptions()
+        # 启动定时调度器
+        self._scheduler_task_obj = asyncio.create_task(self._scheduler_loop())
 
     async def _request(
         self,
@@ -164,20 +171,399 @@ class GF2DailyPlugin(Star):
                 ids.add(i)
         return ids
 
+    # ==================== 每日任务核心逻辑 ====================
+
+    async def _run_daily_tasks(self, session: aiohttp.ClientSession, token: str) -> str:
+        """执行完整每日任务，返回结果字符串（供命令和定时任务共用）"""
+        messages = []           # 任务日志（浏览/点赞/分享/签到）
+        exchange_logs = []     # 兑换日志（独立控制）
+        insufficient_points = False  # 标记是否遇到积分不足
+
+        # 1. 检查任务完成状态
+        task_data = await self._get_task_list(session, token)
+        incomplete_tasks = {}
+        if task_data:
+            # 尝试多种可能的字段名（daily_task / task_list / tasks）
+            task_list = None
+            for key in ("daily_task", "task_list", "tasks", "list"):
+                if key in task_data and isinstance(task_data[key], list):
+                    task_list = task_data[key]
+                    break
+            if task_list is None:
+                # 兜底：如果 data 本身就是列表
+                if isinstance(task_data, list):
+                    task_list = task_data
+                else:
+                    logger.warning(f"GF2 任务列表字段未识别，原始数据: {task_data}")
+            if task_list:
+                for task in task_list:
+                    if not isinstance(task, dict):
+                        continue
+                    name = task.get("task_name") or task.get("name") or task.get("title", "未知任务")
+                    complete = task.get("complete_count", 0)
+                    max_count = task.get("max_complete_count", 0)
+                    if complete < max_count:
+                        incomplete_tasks[name] = max_count - complete
+        logger.info(f"GF2 未完成任务: {incomplete_tasks}")
+
+        if not incomplete_tasks:
+            messages.append("今日任务已全部完成✨")
+
+        # 2. 执行未完成的浏览/点赞/分享
+        topics = await self._get_topic_list(session, token)
+        if not topics:
+            messages.append("未获取到帖子")
+        else:
+            if "浏览帖子" in incomplete_tasks:
+                times = incomplete_tasks["浏览帖子"]
+                for topic in topics[:times]:
+                    if await self._view_topic(session, token, topic["topic_id"]):
+                        messages.append(f"浏览官方板块主题『{topic['title']}』")
+                    await asyncio.sleep(0.5)
+
+            if "点赞帖子" in incomplete_tasks:
+                times = incomplete_tasks["点赞帖子"]
+                for topic in topics[:times]:
+                    if topic.get("is_like"):
+                        await self._like_topic(session, token, topic["topic_id"])
+                        await asyncio.sleep(0.05)
+                        await self._like_topic(session, token, topic["topic_id"])
+                        messages.append(f"取消并再次点赞官方板块主题『{topic['title']}』")
+                    else:
+                        await self._like_topic(session, token, topic["topic_id"])
+                        messages.append(f"点赞官方板块主题『{topic['title']}』")
+                    await asyncio.sleep(0.5)
+
+            if "分享帖子" in incomplete_tasks:
+                times = incomplete_tasks["分享帖子"]
+                for topic in topics[:times]:
+                    if await self._share_topic(session, token, topic["topic_id"]):
+                        messages.append(f"转发官方板块主题『{topic['title']}』")
+                    await asyncio.sleep(0.5)
+
+        # 3. 兑换商品
+        items = await self._get_exchange_list(session, token)
+        configured_ids = self._get_configured_exchange_ids()
+        auto_limited = self.config.get("auto_exchange_limited", True)
+        log_exchanged = self.config.get("log_exchanged_items", False)
+
+        # 按优先级分组：非常驻 > 月刷新 > 日刷新
+        limited_items = []  # 非常驻（限时/终身）
+        month_items = []    # 月刷新
+        day_items = []      # 日刷新
+
+        for item in items:
+            cycle = item.get("cycle", "")
+            if cycle == "day":
+                day_items.append(item)
+            elif cycle == "month":
+                month_items.append(item)
+            else:
+                limited_items.append(item)
+
+        # 同优先级内按积分降序
+        for lst in [limited_items, month_items, day_items]:
+            lst.sort(key=lambda x: x["use_score"], reverse=True)
+
+        stop_exchange = False
+
+        async def process_exchange(item: dict):
+            nonlocal stop_exchange, insufficient_points
+            if stop_exchange:
+                return
+
+            eid = item["exchange_id"]
+            cycle = item.get("cycle", "")
+
+            # 检查是否需要兑换
+            if cycle == "day" and eid not in configured_ids:
+                return
+            if cycle == "month" and eid not in configured_ids:
+                return
+            if cycle not in ("day", "month") and not auto_limited:
+                return
+
+            # 检查剩余次数
+            remain = item["max_exchange_count"] - item["exchange_count"]
+            if remain <= 0:
+                # 已达兑换上限，无条件输出
+                exchange_logs.append(f"已达『{item['item_name']}』兑换上限")
+                return
+
+            # 兑换所有剩余次数
+            for _ in range(remain):
+                user_info = await self._get_user_info(session, token)
+                if not user_info:
+                    return
+
+                score = user_info.get("score", 0)
+                if score < item["use_score"]:
+                    insufficient_points = True
+                    stop_exchange = True
+                    return
+
+                ok, msg = await self._exchange_item(session, token, eid)
+                if ok:
+                    exchange_logs.append(
+                        f"消耗积分{item['use_score']}，成功兑换『{item['item_name']}×{item['item_count']}』"
+                    )
+                else:
+                    # 兑换失败，无条件输出
+                    exchange_logs.append(f"兑换失败『{item['item_name']}』：{msg}")
+                    stop_exchange = True
+                    return
+
+                await asyncio.sleep(0.5)
+
+        for item in limited_items:
+            await process_exchange(item)
+        for item in month_items:
+            await process_exchange(item)
+        for item in day_items:
+            await process_exchange(item)
+
+        # 4. 签到
+        user_info = await self._get_user_info(session, token)
+        ok, msg, sign_data = await self._sign_in(session, token)
+
+        # 5. 汇总输出
+        # exchange_logs 中有三类消息：
+        #   - "已达『xxx』兑换上限"    → 已兑换/已达上限（无需尝试）
+        #   - "兑换失败『xxx』：原因"  → 兑换操作失败
+        #   - "消耗积分xx，成功兑换..." → 本次新兑换成功
+        already_exhausted = [log for log in exchange_logs if log.startswith("已达")]
+        failed_logs = [log for log in exchange_logs if log.startswith("兑换失败")]
+        new_exchanged = [log for log in exchange_logs if log.startswith("消耗")]
+
+        all_messages = []
+
+        if ok and sign_data:
+            # ===== 首次签到成功 =====
+            get_item_name = sign_data.get("get_item_name", "奖励")
+            get_item_count = sign_data.get("get_item_count", 0)
+            all_messages.append(
+                f"{user_info.get('game_nick_name', '用户')}(UID:{user_info.get('game_uid', '?')})"
+                f"签到成功，获得{get_item_name}×{get_item_count}"
+            )
+            # 任务日志（浏览/点赞/分享/签到奖励）
+            all_messages.extend(messages)
+            # 积分不足
+            if insufficient_points:
+                all_messages.append("积分不足，停止兑换，保留积分")
+            # 已兑换商品：OFF时不输出，ON时输出
+            if log_exchanged:
+                all_messages.extend(already_exhausted)
+            # 新兑换成功和失败总是输出（失败需告知用户）
+            all_messages.extend(new_exchanged)
+            all_messages.extend(failed_logs)
+        else:
+            # ===== 重复签到 =====
+            all_messages.append("今天已经签到过了✨")
+            # 已兑换商品：OFF时不输出，ON时输出
+            if log_exchanged:
+                all_messages.extend(already_exhausted)
+            # 重复签到时积分不足/兑换失败不输出（会通过已达上限体现）
+            if log_exchanged:
+                all_messages.extend(new_exchanged)
+                all_messages.extend(failed_logs)
+
+        return "\n".join(all_messages)
+
+    # ==================== 定时任务调度 ====================
+
+    def _get_subscriptions_file(self) -> str:
+        """获取订阅列表持久化文件路径（存放在 AstrBot data 目录下）"""
+        data_dir = os.path.join(os.getcwd(), "data")
+        os.makedirs(data_dir, exist_ok=True)
+        return os.path.join(data_dir, "gf2_daily_subscriptions.json")
+
+    def _load_subscriptions(self):
+        """从文件加载订阅的通知目标列表"""
+        path = self._get_subscriptions_file()
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    self._subscriptions = set(data)
+        except Exception as e:
+            logger.warning(f"GF2 加载订阅列表失败: {e}")
+
+    def _save_subscriptions(self):
+        """保存订阅的通知目标列表到文件"""
+        path = self._get_subscriptions_file()
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(list(self._subscriptions), f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"GF2 保存订阅列表失败: {e}")
+
+    async def _notify_targets(self, text: str):
+        """向所有已订阅的会话推送定时任务结果"""
+        if not self._subscriptions:
+            logger.info("GF2 无订阅目标，跳过通知推送")
+            return
+        chain = MessageChain().message(text)
+        for target in list(self._subscriptions):
+            try:
+                await self.context.send_message(target, chain)
+            except Exception as e:
+                logger.error(f"GF2 推送通知失败 (target={target}): {e}")
+
+    def _parse_schedule_time(self) -> Optional[Tuple[int, int]]:
+        """解析配置中的定时时间 (HH:MM)，返回 (hour, minute) 或 None"""
+        time_str = self.config.get("schedule_time", "09:00")
+        if not isinstance(time_str, str):
+            return None
+        parts = time_str.strip().split(":")
+        if len(parts) != 2:
+            return None
+        try:
+            hour, minute = int(parts[0]), int(parts[1])
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return hour, minute
+        except ValueError:
+            pass
+        return None
+
+    async def _scheduler_loop(self):
+        """定时调度主循环：每天在指定时间执行一次完整每日任务"""
+        logger.info("GF2 定时调度器已启动")
+        while True:
+            try:
+                # 检查定时任务是否启用
+                if not self.config.get("enable_schedule", False):
+                    await asyncio.sleep(30)
+                    continue
+
+                # 解析定时时间
+                parsed = self._parse_schedule_time()
+                if parsed is None:
+                    logger.warning("GF2 定时时间配置无效，等待配置更新...")
+                    await asyncio.sleep(30)
+                    continue
+
+                hour, minute = parsed
+                now = datetime.now()
+                # 计算下一次执行时间（今天的目标时间，如果已过则明天）
+                target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if target <= now:
+                    target += timedelta(days=1)
+
+                # 睡眠到目标时间，每 30 秒唤醒一次以响应配置变更
+                reached_target = False
+                while True:
+                    remaining = (target - datetime.now()).total_seconds()
+                    if remaining <= 0:
+                        reached_target = True
+                        break
+                    await asyncio.sleep(min(remaining, 30))
+                    # 重新检查配置，若时间变更则重新计算目标
+                    new_parsed = self._parse_schedule_time()
+                    if new_parsed is None:
+                        # 配置变为无效，放弃本次等待，回到外层重新检查
+                        logger.warning("GF2 定时时间配置变为无效，重新等待配置...")
+                        break
+                    new_hour, new_minute = new_parsed
+                    new_target = datetime.now().replace(
+                        hour=new_hour, minute=new_minute, second=0, microsecond=0
+                    )
+                    if new_target <= datetime.now():
+                        new_target += timedelta(days=1)
+                    if new_target != target:
+                        target = new_target
+
+                # 未到达目标时间（配置变更导致中断），回到外层重新等待
+                if not reached_target:
+                    continue
+
+                # 到达目标时间，检查账号配置
+                account = self.config.get("account", "")
+                password = self.config.get("password", "")
+                if not account or not password:
+                    logger.warning("GF2 定时任务跳过：未配置社区账号或密码")
+                    continue
+
+                logger.info(f"GF2 定时任务开始执行 (计划时间 {hour:02d}:{minute:02d})")
+                async with aiohttp.ClientSession() as session:
+                    token = await self._login(session, account, password)
+                    if not token:
+                        err_msg = "GF2 定时任务：登录失败，请检查账号密码"
+                        logger.error(err_msg)
+                        await self._notify_targets(err_msg)
+                        continue
+                    result = await self._run_daily_tasks(session, token)
+
+                # 推送结果到所有订阅目标
+                await self._notify_targets(result)
+                logger.info("GF2 定时任务执行完成，结果已推送")
+
+            except asyncio.CancelledError:
+                logger.info("GF2 定时调度器已取消")
+                break
+            except Exception as e:
+                logger.error(f"GF2 定时调度器异常: {e}")
+                await asyncio.sleep(60)
+
+    async def terminate(self):
+        """插件卸载时取消定时任务"""
+        if self._scheduler_task_obj and not self._scheduler_task_obj.done():
+            self._scheduler_task_obj.cancel()
+            try:
+                await self._scheduler_task_obj
+            except (asyncio.CancelledError, Exception):
+                pass
+        logger.info("GF2 插件已卸载，定时任务已停止")
+
     @filter.command("gf2")
     async def gf2(self, event: AstrMessageEvent):
-        """少前2社区每日任务 用法: /gf2 - 执行完整每日任务 /gf2 签到 - 仅签到 /gf2 状态 - 查看积分/等级 /gf2 兑换 - 查看商品列表 /gf2 兑换 <ID> - 手动兑换指定商品 /gf2 调试 - 查看原始API数据"""
-        account = self.config.get("account", "")
-        password = self.config.get("password", "")
-        if not account or not password:
-            yield event.plain_result("请先在插件配置中填写社区账号和密码")
-            return
-
+        """少前2社区每日任务 用法: /gf2 - 执行完整每日任务 /gf2 签到 - 仅签到 /gf2 状态 - 查看积分/等级 /gf2 兑换 - 查看商品列表 /gf2 兑换 <ID> - 手动兑换指定商品 /gf2 调试 - 查看原始API数据 /gf2 订阅 - 订阅每日定时任务通知 /gf2 取消订阅 - 取消定时任务通知"""
         args = event.message_str.strip().split()
         if len(args) == 1:
             sub_cmd = "每日"
         else:
             sub_cmd = args[1]
+
+        # ===== 订阅管理（无需登录） =====
+        if sub_cmd == "订阅":
+            target = event.unified_msg_origin
+            if target in self._subscriptions:
+                yield event.plain_result("当前会话已订阅每日定时任务通知")
+            else:
+                self._subscriptions.add(target)
+                self._save_subscriptions()
+                yield event.plain_result(
+                    "已订阅每日定时任务通知\n"
+                    f"定时任务将在 {self.config.get('schedule_time', '09:00')} 自动执行，结果会推送到本会话"
+                )
+            return
+
+        if sub_cmd == "取消订阅":
+            target = event.unified_msg_origin
+            if target in self._subscriptions:
+                self._subscriptions.discard(target)
+                self._save_subscriptions()
+                yield event.plain_result("已取消每日定时任务通知订阅")
+            else:
+                yield event.plain_result("当前会话未订阅定时任务通知")
+            return
+
+        if sub_cmd == "订阅列表":
+            count = len(self._subscriptions)
+            enabled = self.config.get("enable_schedule", False)
+            time_str = self.config.get("schedule_time", "09:00")
+            yield event.plain_result(
+                f"定时任务状态: {'已启用' if enabled else '未启用'}\n"
+                f"执行时间: {time_str}\n"
+                f"订阅会话数: {count}"
+            )
+            return
+
+        account = self.config.get("account", "")
+        password = self.config.get("password", "")
+        if not account or not password:
+            yield event.plain_result("请先在插件配置中填写社区账号和密码")
+            return
 
         async with aiohttp.ClientSession() as session:
             token = await self._login(session, account, password)
@@ -269,196 +655,5 @@ class GF2DailyPlugin(Star):
                     return
 
             # ===== 每日任务 =====
-            messages = []           # 任务日志（浏览/点赞/分享/签到）
-            exchange_logs = []     # 兑换日志（独立控制）
-            insufficient_points = False  # 标记是否遇到积分不足
-
-            # 1. 检查任务完成状态
-            task_data = await self._get_task_list(session, token)
-            incomplete_tasks = {}
-            if task_data:
-                # 尝试多种可能的字段名（daily_task / task_list / tasks）
-                task_list = None
-                for key in ("daily_task", "task_list", "tasks", "list"):
-                    if key in task_data and isinstance(task_data[key], list):
-                        task_list = task_data[key]
-                        break
-                if task_list is None:
-                    # 兜底：如果 data 本身就是列表
-                    if isinstance(task_data, list):
-                        task_list = task_data
-                    else:
-                        logger.warning(f"GF2 任务列表字段未识别，原始数据: {task_data}")
-                if task_list:
-                    for task in task_list:
-                        if not isinstance(task, dict):
-                            continue
-                        name = task.get("task_name") or task.get("name") or task.get("title", "未知任务")
-                        complete = task.get("complete_count", 0)
-                        max_count = task.get("max_complete_count", 0)
-                        if complete < max_count:
-                            incomplete_tasks[name] = max_count - complete
-            logger.info(f"GF2 未完成任务: {incomplete_tasks}")
-
-            if not incomplete_tasks:
-                messages.append("今日任务已全部完成✨")
-
-            # 2. 执行未完成的浏览/点赞/分享
-            topics = await self._get_topic_list(session, token)
-            if not topics:
-                messages.append("未获取到帖子")
-            else:
-                if "浏览帖子" in incomplete_tasks:
-                    times = incomplete_tasks["浏览帖子"]
-                    for topic in topics[:times]:
-                        if await self._view_topic(session, token, topic["topic_id"]):
-                            messages.append(f"浏览官方板块主题『{topic['title']}』")
-                        await asyncio.sleep(0.5)
-
-                if "点赞帖子" in incomplete_tasks:
-                    times = incomplete_tasks["点赞帖子"]
-                    for topic in topics[:times]:
-                        if topic.get("is_like"):
-                            await self._like_topic(session, token, topic["topic_id"])
-                            await asyncio.sleep(0.05)
-                            await self._like_topic(session, token, topic["topic_id"])
-                            messages.append(f"取消并再次点赞官方板块主题『{topic['title']}』")
-                        else:
-                            await self._like_topic(session, token, topic["topic_id"])
-                            messages.append(f"点赞官方板块主题『{topic['title']}』")
-                        await asyncio.sleep(0.5)
-
-                if "分享帖子" in incomplete_tasks:
-                    times = incomplete_tasks["分享帖子"]
-                    for topic in topics[:times]:
-                        if await self._share_topic(session, token, topic["topic_id"]):
-                            messages.append(f"转发官方板块主题『{topic['title']}』")
-                        await asyncio.sleep(0.5)
-
-            # 3. 兑换商品
-            items = await self._get_exchange_list(session, token)
-            configured_ids = self._get_configured_exchange_ids()
-            auto_limited = self.config.get("auto_exchange_limited", True)
-            log_exchanged = self.config.get("log_exchanged_items", False)
-
-            # 按优先级分组：非常驻 > 月刷新 > 日刷新
-            limited_items = []  # 非常驻（限时/终身）
-            month_items = []    # 月刷新
-            day_items = []      # 日刷新
-
-            for item in items:
-                cycle = item.get("cycle", "")
-                if cycle == "day":
-                    day_items.append(item)
-                elif cycle == "month":
-                    month_items.append(item)
-                else:
-                    limited_items.append(item)
-
-            # 同优先级内按积分降序
-            for lst in [limited_items, month_items, day_items]:
-                lst.sort(key=lambda x: x["use_score"], reverse=True)
-
-            stop_exchange = False
-
-            async def process_exchange(item: dict):
-                nonlocal stop_exchange, insufficient_points
-                if stop_exchange:
-                    return
-
-                eid = item["exchange_id"]
-                cycle = item.get("cycle", "")
-
-                # 检查是否需要兑换
-                if cycle == "day" and eid not in configured_ids:
-                    return
-                if cycle == "month" and eid not in configured_ids:
-                    return
-                if cycle not in ("day", "month") and not auto_limited:
-                    return
-
-                # 检查剩余次数
-                remain = item["max_exchange_count"] - item["exchange_count"]
-                if remain <= 0:
-                    # 已达兑换上限，无条件输出
-                    exchange_logs.append(f"已达『{item['item_name']}』兑换上限")
-                    return
-
-                # 兑换所有剩余次数
-                for _ in range(remain):
-                    user_info = await self._get_user_info(session, token)
-                    if not user_info:
-                        return
-
-                    score = user_info.get("score", 0)
-                    if score < item["use_score"]:
-                        insufficient_points = True
-                        stop_exchange = True
-                        return
-
-                    ok, msg = await self._exchange_item(session, token, eid)
-                    if ok:
-                        exchange_logs.append(
-                            f"消耗积分{item['use_score']}，成功兑换『{item['item_name']}×{item['item_count']}』"
-                        )
-                    else:
-                        # 兑换失败，无条件输出
-                        exchange_logs.append(f"兑换失败『{item['item_name']}』：{msg}")
-                        stop_exchange = True
-                        return
-
-                    await asyncio.sleep(0.5)
-
-            for item in limited_items:
-                await process_exchange(item)
-            for item in month_items:
-                await process_exchange(item)
-            for item in day_items:
-                await process_exchange(item)
-
-            # 4. 签到
-            user_info = await self._get_user_info(session, token)
-            ok, msg, sign_data = await self._sign_in(session, token)
-
-            # 5. 汇总输出
-            # exchange_logs 中有三类消息：
-            #   - "已达『xxx』兑换上限"    → 已兑换/已达上限（无需尝试）
-            #   - "兑换失败『xxx』：原因"  → 兑换操作失败
-            #   - "消耗积分xx，成功兑换..." → 本次新兑换成功
-            already_exhausted = [log for log in exchange_logs if log.startswith("已达")]
-            failed_logs = [log for log in exchange_logs if log.startswith("兑换失败")]
-            new_exchanged = [log for log in exchange_logs if log.startswith("消耗")]
-
-            all_messages = []
-
-            if ok and sign_data:
-                # ===== 首次签到成功 =====
-                get_item_name = sign_data.get("get_item_name", "奖励")
-                get_item_count = sign_data.get("get_item_count", 0)
-                all_messages.append(
-                    f"{user_info.get('game_nick_name', '用户')}(UID:{user_info.get('game_uid', '?')})"
-                    f"签到成功，获得{get_item_name}×{get_item_count}"
-                )
-                # 任务日志（浏览/点赞/分享/签到奖励）
-                all_messages.extend(messages)
-                # 积分不足
-                if insufficient_points:
-                    all_messages.append("积分不足，停止兑换，保留积分")
-                # 已兑换商品：OFF时不输出，ON时输出
-                if log_exchanged:
-                    all_messages.extend(already_exhausted)
-                # 新兑换成功和失败总是输出（失败需告知用户）
-                all_messages.extend(new_exchanged)
-                all_messages.extend(failed_logs)
-            else:
-                # ===== 重复签到 =====
-                all_messages.append("今天已经签到过了✨")
-                # 已兑换商品：OFF时不输出，ON时输出
-                if log_exchanged:
-                    all_messages.extend(already_exhausted)
-                # 重复签到时积分不足/兑换失败不输出（会通过已达上限体现）
-                if log_exchanged:
-                    all_messages.extend(new_exchanged)
-                    all_messages.extend(failed_logs)
-
-            yield event.plain_result("\n".join(all_messages))
+            result = await self._run_daily_tasks(session, token)
+            yield event.plain_result(result)
